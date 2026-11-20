@@ -2,11 +2,15 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Every literal t("...") / t('...') key must exist in the locale dictionary
+// Every literal t("...") / t('...') key must exist in every locale dictionary
 // with the same {placeholders}. Dynamic keys (variables, template literals
 // with ${}) are skipped: there is nothing to compare them against.
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const dict = JSON.parse(readFileSync(join(root, "src/i18n/locales/tr.json"), "utf8"));
+const localesDir = join(root, "src/i18n/locales");
+const dicts = readdirSync(localesDir)
+  .filter((name) => name.endsWith(".json"))
+  .sort()
+  .map((name) => [name, JSON.parse(readFileSync(join(localesDir, name), "utf8"))]);
 
 const files = [];
 function walk(dir) {
@@ -37,28 +41,26 @@ function placeholders(s) {
     .join(",");
 }
 
-const missing = [];
-const mismatch = [];
-for (const [key, file] of calls) {
-  if (!Object.prototype.hasOwnProperty.call(dict, key)) {
-    missing.push(`${file}: ${JSON.stringify(key)}`);
-    continue;
+let failed = false;
+for (const [name, dict] of dicts) {
+  const missing = [];
+  const mismatch = [];
+  for (const [key, file] of calls) {
+    if (!Object.prototype.hasOwnProperty.call(dict, key)) {
+      missing.push(`${file}: ${JSON.stringify(key)}`);
+      continue;
+    }
+    if (placeholders(dict[key]) !== placeholders(key)) {
+      mismatch.push(`${JSON.stringify(key)}: source {${placeholders(key)}} dict {${placeholders(dict[key])}}`);
+    }
   }
-  if (placeholders(dict[key]) !== placeholders(key)) {
-    mismatch.push(`${JSON.stringify(key)}: source {${placeholders(key)}} dict {${placeholders(dict[key])}}`);
-  }
-}
-
-if (missing.length || mismatch.length) {
   if (missing.length) {
-    console.error(`Missing tr.json entries (${missing.length}):\n${missing.join("\n")}`);
+    console.error(`Missing ${name} entries (${missing.length}):\n${missing.join("\n")}`);
   }
   if (mismatch.length) {
-    console.error(`Placeholder mismatches (${mismatch.length}):\n${mismatch.join("\n")}`);
+    console.error(`Placeholder mismatches in ${name} (${mismatch.length}):\n${mismatch.join("\n")}`);
   }
-  process.exit(1);
+  failed ||= missing.length > 0 || mismatch.length > 0;
+  console.log(`i18n: ${calls.size} literal keys checked against ${Object.keys(dict).length} ${name} entries`);
 }
-
-console.log(
-  `i18n: ${calls.size} literal keys checked against ${Object.keys(dict).length} tr.json entries`,
-);
+if (failed) process.exit(1);

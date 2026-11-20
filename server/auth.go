@@ -172,9 +172,43 @@ func samePath(a, b string) bool {
 // sessionClaims carries the password version the token was signed under.
 // Two changes in the same second get different versions, so a cutoff based on
 // the issued-at second cannot leave the older token valid.
+//
+// Uid and Uv are set only for an additional account (users table): its id and
+// its own password version. A bootstrap-account token has neither and is
+// checked against the global version as before.
 type sessionClaims struct {
 	Pwd int64 `json:"pwd"`
+	Uid int64 `json:"uid,omitempty"`
+	Uv  int64 `json:"uv,omitempty"`
 	jwt.RegisteredClaims
+}
+
+// signUserJWT issues a 7-day HS256 token for an additional account.
+func signUserJWT(key []byte, uid int64, username string, version int64) (string, error) {
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, sessionClaims{
+		Uid: uid,
+		Uv:  version,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   username,
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}).SignedString(key)
+}
+
+// parseSessionClaims returns the claims of a valid, non-expired HS256 token.
+func parseSessionClaims(tokenStr string, key []byte) (*sessionClaims, bool) {
+	claims := &sessionClaims{}
+	t, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return key, nil
+	})
+	if err != nil || !t.Valid {
+		return nil, false
+	}
+	return claims, true
 }
 
 // signJWT issues a 7-day HS256 token for user ARTEX at password version 0.
@@ -217,9 +251,15 @@ func verifyJWT(tokenStr string, key []byte, version int64) bool {
 // sessionOK reports whether token is still a session for the password version
 // this process has loaded. A failed version read rejects every token until
 // login reads the counter again.
+//
+// A token for an additional account is checked against that account's cached
+// row instead: it must exist, be enabled and carry the account's version.
 func (s *Server) sessionOK(token string) bool {
 	if s.pwdState.Load() == pwdUnreadable {
 		return false
+	}
+	if claims, ok := parseSessionClaims(token, s.jwtKey); ok && claims.Uid > 0 {
+		return s.users.valid(claims.Uid, claims.Subject, claims.Uv)
 	}
 	return verifyJWT(token, s.jwtKey, s.pwdVersion.Load())
 }
@@ -300,7 +340,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "token is invalid or expired")
 			return
 		}
-		h.ServeHTTP(w, r)
+		s.auditMutations(jwtSubject(tok, s.jwtKey), h).ServeHTTP(w, r)
 	})
 }
 
@@ -503,6 +543,10 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, msg)
 		return
 	}
+	if claims, ok := parseSessionClaims(extractToken(r), s.jwtKey); ok && claims.Uid > 0 {
+		s.changeUserPassword(w, r, claims, req.OldPassword, req.NewPassword)
+		return
+	}
 	hash, ok, err := pg.GetSetting(s.passwordHashKey())
 	if err != nil {
 		writeErr(w, 503, errDataSourceUnavailable)
@@ -582,8 +626,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(s
 		writeErr(w, 400, "Invalid request format")
 		return
 	}
-	if req.Username != "ARTEX" {
-		writeErr(w, 401, "Incorrect username or password")
+	if req.Username != ownerUsername {
+		s.loginUser(w, r, ip, req.Username, req.Password)
 		return
 	}
 	hash, ok, err := getSetting(s.passwordHashKey())
@@ -612,5 +656,6 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(s
 		writeErr(w, 500, "token generation failed")
 		return
 	}
+	s.audit(ownerUsername, "LOGIN", "/api/auth/login", 200, ip)
 	writeJSON(w, 200, map[string]any{"token": tok})
 }

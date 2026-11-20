@@ -19,7 +19,7 @@ func serveUA(t *testing.T, userAgent string) string {
 	}))
 	defer srv.Close()
 
-	client, err := quotaAwareHTTPClient("", "", userAgent)
+	client, err := quotaAwareHTTPClient("", "", userAgent, "")
 	if err != nil {
 		t.Fatalf("quotaAwareHTTPClient: %v", err)
 	}

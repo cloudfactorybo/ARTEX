@@ -566,6 +566,8 @@ func (s *Server) seedOrchestrationTools() {
 	s.reseedPlannerPrompt()           // planner prompt: rewrites the "zero intents" justification rules + adds quantitative acceptance checks (one-time)
 	s.reseedWorkerPrompt()            // worker prompt: adds the evidence bar for negative conclusions (one-time)
 	s.seedReporterAgent()             // seeds the "report writer" agent + tool bindings + finding trigger (one-time)
+	s.seedDefenseAgent()              // seeds the "defensa" blue-team agent (one-time): owns the finding report, disables the reporter's auto-trigger
+	s.seedWebAgent()                  // seeds the "web" specialist agent (one-time) + makes the web skills visible to the worker
 	s.upgradeReporterTriggerMessage() // backfill migration for old DBs: makes the reporter send evidence_version back (one-time)
 	s.seedFindingTrafficTools()       // adds optional evidence params and read-only evidence tools, preserving user config
 	s.seedFindingWorkflowTools()
@@ -911,6 +913,166 @@ func (s *Server) seedReporterAgent() {
 		log.Printf("[reporter] failed to create trigger: %v", err)
 	}
 	log.Printf("[reporter] seeded the 'report writer' agent + finding trigger")
+}
+
+// defenseToolCallMessage is the trigger context for the defensive agent, sent
+// whenever report_finding registers a vulnerability.
+const defenseTaskReportMessage = "La tarea terminó (objetivos cumplidos o timeout). Lee el task_id del contexto y escribe con Write DOS archivos en tasks/<task_id>/ (rutas relativas): (1) informe_final.md = informe para el CLIENTE (alcance, inventario de endpoints, por categoría OWASP confirmada/negativa=control efectivo/no testeable, hallazgos con nivel de peligro via list_task_findings —si no hay, dilo y lista los controles efectivos—, cobertura via get_task_graph, recomendaciones priorizadas); (2) resumen_tecnico.md = RESUMEN TÉCNICO para el EQUIPO (qué se hizo paso a paso con herramientas y payloads leyendo las trazas, qué NO se pudo probar y por qué, credenciales usadas via list_task_credentials sin contraseñas en claro, cómo se logró cada hallazgo, y qué queda pendiente). Una evaluación sin hallazgos NO es un informe vacío. No inventes."
+
+const defenseToolCallMessage = "Se registró una vulnerabilidad con report_finding. Lee finding_id (id del registro) y finding_node_id (id del nodo) del JSON devuelto, " +
+	"luego get_finding_traffic(finding_id) para el tráfico y su version (una lista vacía es normal). Reconstruye la prueba reproducible (curl + colección Postman) desde el tráfico real, " +
+	"asigna el nivel de peligro y escribe las recomendaciones de protección. Finalmente update_finding_report(finding_id=finding_node_id, report, evidence_version=la version leída). No mezcles los dos ids."
+
+// seedDefenseAgent presets the "defensa" blue-team agent (builtin=false, editable
+// and deletable): it is the primary, client-facing report author. It triggers on
+// every registered vulnerability, reads the evidence and worker traces, assigns a
+// danger level, builds a reproducible proof (curl + a Postman collection saved to
+// the work directory) and writes protection recommendations and detection, all in
+// Spanish, back into the finding report. Because it owns the finding report, the
+// seed also disables the reporter's auto-trigger when it is still the unmodified
+// seeded one, so the two never race on update_finding_report; the reporter agent
+// stays available for manual use and its trigger can be re-enabled in the UI.
+// One-time (settings-flag guard): once the user deletes the agent, it is never recreated.
+func (s *Server) seedDefenseAgent() {
+	const flag = "defense_agent_seed_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // attempt only once regardless of outcome
+
+	if exist, _ := s.m.pg.GetAgentByKey("defensa"); exist != nil {
+		return // key already taken (user created it) — do not overwrite
+	}
+	a, err := s.m.pg.CreateAgent("defensa", "Defensa (blue team)",
+		"Agente defensivo: cuando se registra una vulnerabilidad, lee la evidencia y las trazas y escribe el informe para el cliente — nivel de peligro, cómo se hizo con prueba reproducible (curl + Postman), recomendaciones de protección y detección.")
+	if err != nil {
+		log.Printf("[defensa] failed to create agent: %v", err)
+		return
+	}
+	if err := s.m.pg.SeedPromptIfEmpty(a.ID, agent.DefenseDefaultPrompt); err != nil {
+		log.Printf("[defensa] seed prompt failed: %v", err)
+	}
+	// One defensive report per vulnerability; several findings in parallel, each its own run.
+	if err := s.m.pg.SetAgentTriggerBehavior("defensa", "parallel", "none", 5); err != nil {
+		log.Printf("[defensa] failed to set trigger run policy: %v", err)
+	}
+	// Reads evidence/traffic/traces + writes the report. Write (from DefaultTools) saves the Postman collection to the work dir.
+	if err := s.m.pg.AddAgentToToolBinding("defensa", []string{
+		"update_finding_report", "get_finding_traffic", "get_task_node_detail", "list_task_findings",
+		"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces",
+		"get_task_graph",
+	}); err != nil {
+		log.Printf("[defensa] failed to bind tools: %v", err)
+	}
+	// Make the three defensive/evasion skills visible to this agent (methodology).
+	for _, sk := range []string{"remediation-advisory", "detection-engineering", "waf-evasion"} {
+		if err := s.m.pg.ToggleSkillVisibility(a.ID, sk, true); err != nil {
+			log.Printf("[defensa] failed to make skill %s visible: %v", sk, err)
+		}
+	}
+	// Trigger: fires whenever report_finding is called.
+	if _, err := s.m.pg.CreateTrigger(&db.AgentTrigger{
+		AgentKey:        "defensa",
+		Enabled:         true,
+		OnToolCall:      true,
+		ToolNames:       []string{"report_finding"},
+		ToolCallMessage: defenseToolCallMessage,
+	}); err != nil {
+		log.Printf("[defensa] failed to create trigger: %v", err)
+	}
+	if _, err := s.m.pg.CreateTrigger(&db.AgentTrigger{
+		AgentKey: "defensa", Enabled: true, OnGoalMet: true, GoalMessage: defenseTaskReportMessage,
+	}); err != nil {
+		log.Printf("[defensa] failed to create goal-met trigger: %v", err)
+	}
+	if _, err := s.m.pg.CreateTrigger(&db.AgentTrigger{
+		AgentKey: "defensa", Enabled: true, OnTaskTimeout: true, TaskTimeoutMessage: defenseTaskReportMessage,
+	}); err != nil {
+		log.Printf("[defensa] failed to create timeout trigger: %v", err)
+	}
+	// Defensa owns the finding report now — disable the reporter's auto-trigger if it
+	// is still the unmodified seeded one, so the two never race. Reporter stays usable.
+	if triggers, err := s.m.pg.ListTriggersFor("reporter"); err == nil {
+		for _, t := range triggers {
+			if t.OnToolCall && t.Enabled && (t.ToolCallMessage == reporterToolCallMessage || t.ToolCallMessage == reporterToolCallMessageV1) {
+				t.Enabled = false
+				if err := s.m.pg.UpdateTrigger(t); err != nil {
+					log.Printf("[defensa] failed to disable reporter trigger: %v", err)
+				} else {
+					log.Printf("[defensa] disabled the reporter auto-trigger; defensa now owns the finding report")
+				}
+			}
+		}
+	}
+	log.Printf("[defensa] seeded the blue-team agent + finding trigger + defensive skills")
+}
+
+// webPentestSkills is the web attack surface: the skills the web specialist sees
+// and that are also made visible to the exploration worker so autonomous tasks
+// attack web well. Ordered recon -> exploitation -> evasion -> browser.
+var webPentestSkills = []string{
+	"api-recon", "bbot-recon", "web-exploitation", "api-security", "web-access-control",
+	"client-side-attacks", "file-upload-attacks", "auth-session", "secrets-hunting",
+	"cms-exploitation", "waf-evasion", "playwright-cli",
+}
+
+// seedWebAgent presets the "web" specialist agent (builtin=false, editable and
+// deletable): an interactive web-application pentester driven from the Chat page,
+// with every web skill visible and the offensive domain tools bound. It is not a
+// finding-report author and carries no trigger — it finds and registers
+// vulnerabilities (report_finding), and the defensa agent writes the report. The
+// seed also makes the web skills visible to the exploration worker, so autonomous
+// tasks are web-capable too. One-time (settings-flag guard); once the user deletes
+// the agent, it is never recreated.
+func (s *Server) seedWebAgent() {
+	const flag = "web_agent_seed_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+
+	// Always (re)apply web-skill visibility to the worker, even if the web agent
+	// already exists, so an upgraded deployment gets a web-equipped worker once.
+	if wk, _ := s.m.pg.GetAgentByKey("worker"); wk != nil {
+		for _, sk := range webPentestSkills {
+			if err := s.m.pg.ToggleSkillVisibility(wk.ID, sk, true); err != nil {
+				log.Printf("[web] failed to make skill %s visible to worker: %v", sk, err)
+			}
+		}
+	}
+
+	if exist, _ := s.m.pg.GetAgentByKey("web"); exist != nil {
+		return // key taken (user created it) — do not overwrite
+	}
+	a, err := s.m.pg.CreateAgent("web", "Web Pentest",
+		"Especialista en pentesting web: ataca la superficie web (OWASP, API, auth, IDOR, client-side, upload, CMS, evasión de WAF) con todas las skills web, registra hallazgos y deja que el agente de defensa escriba el informe.")
+	if err != nil {
+		log.Printf("[web] failed to create agent: %v", err)
+		return
+	}
+	if err := s.m.pg.SeedPromptIfEmpty(a.ID, agent.WebPentestDefaultPrompt); err != nil {
+		log.Printf("[web] seed prompt failed: %v", err)
+	}
+	// Offensive domain tools (DefaultTools — Bash/Read/Write/Edit/Grep/Glob — come automatically).
+	if err := s.m.pg.AddAgentToToolBinding("web", []string{
+		"record_fact", "report_finding", "insert_assets", "list_assets", "node_detail",
+		"list_findings", "get_finding_traffic", "traffic_search", "traffic_get", "traffic_messages", "traffic_blob",
+		"save_task_credential", "list_task_credentials", "ask_operator",
+		"get_worker_trace", "search_all_worker_traces",
+	}); err != nil {
+		log.Printf("[web] failed to bind tools: %v", err)
+	}
+	// Every web skill visible to the specialist.
+	for _, sk := range webPentestSkills {
+		if err := s.m.pg.ToggleSkillVisibility(a.ID, sk, true); err != nil {
+			log.Printf("[web] failed to make skill %s visible: %v", sk, err)
+		}
+	}
+	// Web search on for CVE/technique lookups.
+	if err := s.m.pg.SetAgentWebSearch("web", true); err != nil {
+		log.Printf("[web] failed to enable web search: %v", err)
+	}
+	log.Printf("[web] seeded the web specialist agent + bound tools + web skills; worker is now web-equipped")
 }
 
 // seedAutoReportFindingBinding adds "auto" to report_finding's binding ONCE so

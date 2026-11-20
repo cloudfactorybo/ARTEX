@@ -11,6 +11,11 @@ import (
 
 const IntentBlockedLLMQuota = "llm_quota_exhausted"
 
+// IntentBlockedToolSchema marks an intent blocked because the model server
+// rejected a tool schema it cannot compile (vLLM "Invalid grammar
+// specification"). Rerunning fails the same way until the tool is fixed.
+const IntentBlockedToolSchema = "llm_tool_schema"
+
 // TaskLLMProfile is one ordered entry in a task's explicit failover chain.
 type TaskLLMProfile struct {
 	ProfileID   int64      `json:"profile_id"`

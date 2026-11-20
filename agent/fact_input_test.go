@@ -141,17 +141,22 @@ func TestRecordFactStrictFields(t *testing.T) {
 
 func TestRecordFactSchemaMatchesStrings(t *testing.T) {
 	props := recordFactSchema()["properties"].(map[string]any)
-	summary := regexp.MustCompile(props["summary"].(map[string]any)["pattern"].(string))
-	for _, value := range []string{"", " ", "\t\r\n", "\u00a0\u0085", "\u2003\u3000", "conclusion", "  observed  "} {
-		if got, want := summary.MatchString(value), strings.TrimSpace(value) != ""; got != want {
-			t.Errorf("summary %q: schema=%v runtime=%v", value, got, want)
-		}
+	summary := props["summary"].(map[string]any)
+	if _, ok := summary["pattern"]; ok || summary["minLength"] != 1 {
+		t.Fatalf("summary schema = %v, want minLength 1 and no pattern (the handler rejects blanks)", summary)
 	}
 	id := regexp.MustCompile(factAssetIDSchema()["pattern"].(string))
-	for _, value := range []string{"1", "001", "+1", " +001 ", "\u200312\u3000", "", "0", "-1", "1.5", "a"} {
+	for _, value := range []string{"1", "001", "+1", " +001 ", "\t7\n", "", "0", "-1", "1.5", "a"} {
 		raw, _ := json.Marshal(value)
 		if got, want := id.MatchString(value), pid(raw) > 0; got != want {
 			t.Errorf("asset ID %q: schema=%v runtime=%v", value, got, want)
+		}
+	}
+	// The ASCII-only schema may be stricter than the runtime, never looser.
+	for _, value := range []string{"\u200312\u3000", "\u00a05"} {
+		raw, _ := json.Marshal(value)
+		if id.MatchString(value) || pid(raw) <= 0 {
+			t.Errorf("asset ID %q: schema=%v runtime=%v, want schema false runtime true", value, id.MatchString(value), pid(raw) > 0)
 		}
 	}
 	for _, input := range []string{
@@ -160,6 +165,71 @@ func TestRecordFactSchemaMatchesStrings(t *testing.T) {
 	} {
 		if err := actool.ValidateInput(recordFactSchema(), json.RawMessage(input)); err != nil {
 			t.Errorf("numeric-string compatibility rejected: %v", err)
+		}
+	}
+}
+
+// legacyFactWhitespace is the Unicode class earlier releases published in the
+// record_fact patterns; vLLM cannot compile it into a grammar.
+const legacyFactWhitespace = "\t\n\v\f\r \u0085   -     　"
+
+func schemaPatterns(v any, path string, visit func(path, pattern string)) {
+	switch node := v.(type) {
+	case map[string]any:
+		for key, child := range node {
+			if p, ok := child.(string); ok && key == "pattern" {
+				visit(path, p)
+				continue
+			}
+			schemaPatterns(child, path+"."+key, visit)
+		}
+	case []any:
+		for _, child := range node {
+			schemaPatterns(child, path+"[]", visit)
+		}
+	}
+}
+
+func asciiPattern(t *testing.T, schema map[string]any) {
+	t.Helper()
+	raw, _ := json.Marshal(schema)
+	var generic map[string]any
+	_ = json.Unmarshal(raw, &generic)
+	schemaPatterns(generic, "$", func(path, pattern string) {
+		for _, r := range pattern {
+			if r > 0x7e {
+				t.Errorf("%s.pattern %q has non-ASCII %U; grammar-constrained decoders reject it", path, pattern, r)
+				return
+			}
+		}
+	})
+}
+
+func TestRecordFactSchemaPatternsAreASCII(t *testing.T) {
+	asciiPattern(t, recordFactSchema())
+}
+
+func TestRepairRecordFactSchemaDropsUnicodePatterns(t *testing.T) {
+	legacy := recordFactSchema()
+	legacyID := "^[" + legacyFactWhitespace + "]*\\+?0*[1-9][0-9]*[" + legacyFactWhitespace + "]*$"
+	props := legacy["properties"].(map[string]any)
+	itemProps := props["facts"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
+	for _, p := range []map[string]any{props, itemProps} {
+		p["summary"].(map[string]any)["pattern"] = "[^" + legacyFactWhitespace + "]"
+		for _, field := range []string{"asset_ids", "tested_asset_ids"} {
+			p[field].(map[string]any)["items"].(map[string]any)["pattern"] = legacyID
+		}
+	}
+	repaired := RepairRecordFactSchema(legacy)
+	asciiPattern(t, repaired)
+	rp := repaired["properties"].(map[string]any)
+	rItems := rp["facts"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
+	for _, p := range []map[string]any{rp, rItems} {
+		if _, ok := p["summary"].(map[string]any)["pattern"]; ok {
+			t.Errorf("repaired summary still has a pattern: %v", p["summary"])
+		}
+		if got, want := p["asset_ids"].(map[string]any)["items"].(map[string]any)["pattern"], factAssetIDSchema()["pattern"]; got != want {
+			t.Errorf("repaired asset_ids pattern = %v, want %v", got, want)
 		}
 	}
 }

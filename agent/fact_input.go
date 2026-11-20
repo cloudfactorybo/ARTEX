@@ -6,13 +6,18 @@ import (
 	"fmt"
 )
 
-// Match strings.TrimSpace, including Unicode whitespace, in the published schema.
-const factWhitespace = "\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
+// factSchemaSpace is the whitespace allowed around numeric-string asset IDs in
+// the published schema. It is ASCII on purpose: grammar-constrained decoders
+// (vLLM) fail to compile Unicode ranges in pattern classes ("Invalid grammar
+// specification"), and one such tool schema fails the whole request. The
+// handler still trims Unicode whitespace at runtime (pid), so the schema may be
+// stricter than the runtime, never looser.
+const factSchemaSpace = ` \t\n\r`
 
 func factAssetIDSchema() map[string]any {
 	return map[string]any{
 		"type": []string{"integer", "string"}, "minimum": 1,
-		"pattern": "^[" + factWhitespace + "]*\\+?0*[1-9][0-9]*[" + factWhitespace + "]*$",
+		"pattern": "^[" + factSchemaSpace + "]*\\+?0*[1-9][0-9]*[" + factSchemaSpace + "]*$",
 	}
 }
 
@@ -28,8 +33,8 @@ func factItemSchema() map[string]any {
 		"tested_asset_ids": map[string]any{"type": "array", "items": factAssetIDSchema(), "description": "Compatibility alias for asset_ids, not an additional list. When both are provided their sets must match. Only include assets actually involved in this conclusion."},
 	}, "summary")
 	summary := schema["properties"].(map[string]any)["summary"].(map[string]any)
+	// No pattern: a blank summary is rejected by the handler (strings.TrimSpace).
 	summary["minLength"] = 1
-	summary["pattern"] = "[^" + factWhitespace + "]"
 	schema["additionalProperties"] = false
 	return schema
 }
@@ -71,6 +76,13 @@ func RepairRecordFactSchema(stored map[string]any) map[string]any {
 	for name := range itemProps {
 		if _, known := canonical[name]; !known || name == "facts" {
 			delete(itemProps, name)
+		}
+	}
+	// The merge never deletes keys, so a stored schema keeps the summary pattern
+	// the contract no longer publishes; drop it here.
+	for _, p := range []map[string]any{props, itemProps} {
+		if summary, ok := p["summary"].(map[string]any); ok {
+			delete(summary, "pattern")
 		}
 	}
 	return out

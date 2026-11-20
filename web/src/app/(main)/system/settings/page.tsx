@@ -16,6 +16,7 @@ import { api } from "@/lib/api";
 import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSendMode } from "@/lib/chat-send-mode";
 import type { Settings } from "@/lib/types";
 
+import { AgentLanguageCard } from "./agent-language-card";
 import { NoiseProfileCard } from "./noise-profile-card";
 
 // Renders a translated string, turning <b>…</b> and <code>…</code> spans into elements, so a sentence with emphasis stays one key.
@@ -333,6 +334,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
+        <AgentLanguageCard />
         <NoiseProfileCard />
 
         <Card className="mb-4 break-inside-avoid md:mb-6">

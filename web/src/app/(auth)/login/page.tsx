@@ -15,8 +15,18 @@ import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import { auth } from "@/lib/auth";
 
+// The last username that signed in on this browser, to prefill the form.
+const LAST_USER_KEY = "artex.lastUser";
+
 export default function LoginPage() {
   const router = useRouter();
+  const [username, setUsername] = useState(() => {
+    try {
+      return (typeof window !== "undefined" && window.localStorage.getItem(LAST_USER_KEY)) || "ARTEX";
+    } catch {
+      return "ARTEX";
+    }
+  });
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -69,11 +79,18 @@ export default function LoginPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.login("ARTEX", password);
+      const { token } = await api.login(username.trim(), password);
+      try {
+        window.localStorage.setItem(LAST_USER_KEY, username.trim());
+      } catch {
+        /* storage blocked: the form just won't be prefilled next time */
+      }
       auth.setToken(token);
       window.location.replace("/function/tasks");
-    } catch {
-      setError(t("Incorrect username or password"));
+    } catch (err) {
+      // Disabled accounts and rate limits come back with their own message; anything else stays generic.
+      const status = (err as { status?: number }).status;
+      setError(status === 403 || status === 429 ? (err as Error).message : t("Incorrect username or password"));
     } finally {
       setLoading(false);
     }
@@ -110,13 +127,21 @@ export default function LoginPage() {
           <div className="space-y-4 text-center">
             <h2 className="text-2xl font-medium tracking-tight">{t("Sign in")}</h2>
             <p className="mx-auto max-w-xl text-muted-foreground">
-              {t("Welcome back — enter your password to continue using ARTEX")}
+              {t("Welcome back — sign in with your username and password to continue using ARTEX")}
             </p>
           </div>
           <form onSubmit={handleSubmit} className="flex flex-col gap-4">
             <div className="space-y-1.5">
               <Label htmlFor="username">{t("Username")}</Label>
-              <Input id="username" value="ARTEX" readOnly className="bg-muted text-muted-foreground" />
+              <Input
+                id="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder={t("Username")}
+                autoComplete="username"
+                autoCapitalize="none"
+                spellCheck={false}
+              />
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="password">{t("Password")}</Label>
@@ -150,7 +175,7 @@ export default function LoginPage() {
               </Label>
             </div>
             {error && <p className="text-sm text-destructive">{error}</p>}
-            <Button type="submit" className="w-full" disabled={loading || !password || !agreed}>
+            <Button type="submit" className="w-full" disabled={loading || !username.trim() || !password || !agreed}>
               {loading ? t("Signing in...") : t("Sign in")}
             </Button>
           </form>

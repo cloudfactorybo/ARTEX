@@ -1026,7 +1026,11 @@ export interface Settings {
   notify_assets_max_shown?: number; // asset names listed per finding, 0-50, default 3
   // Target noise profile; the stored setting wins over ARTEX_NOISE_PROFILE. Applies to the next request.
   noise_profile?: NoiseProfileName;
+  // Language of the agents' human-facing text; the stored setting wins over ARTEX_AGENT_LANGUAGE. Default es.
+  agent_language?: AgentLanguage;
 }
+
+export type AgentLanguage = "es" | "en" | "auto";
 
 export type NoiseProfileName = "off" | "quiet" | "balanced" | "aggressive";
 
@@ -1125,6 +1129,7 @@ export interface LLMProfile {
   proxy?: string;
   model: string;
   api_key_hint?: string;
+  ca_cert?: string; // extra CA certificates (PEM) trusted for this endpoint; "" = system pool only
   rate_per_second: number;
   rate_per_minute: number;
   context_window_k?: number;
@@ -1416,7 +1421,6 @@ export type TaskCredential = TaskCredentialInput & {
   created_at: string;
   updated_at: string;
 };
-
 
 export interface AssetInterceptRule {
   id: number;
@@ -1714,4 +1718,96 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+// ---- users (GET /api/users, /api/auth/me, /api/users/audit) ----
+
+// The bootstrap account (ARTEX) is listed with id 0 and owner true.
+export interface UserAccount {
+  id: number;
+  username: string;
+  disabled: boolean;
+  owner: boolean;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  last_login_at?: string;
+}
+
+export interface SessionAccount {
+  id: number;
+  username: string;
+  owner: boolean;
+}
+
+export interface UserAuditEntry {
+  id: number;
+  at: string;
+  username: string;
+  action: string;
+  path: string;
+  status: number;
+  ip: string;
+}
+
+// POST /api/llm/inspect: health route, models and context window of an OpenAI-format endpoint.
+export interface GatewayReport {
+  health_url?: string;
+  healthy: boolean | null; // null = the endpoint has no health route
+  health_status?: number;
+  models: string[] | null;
+  context_limit: number; // tokens; 0 = unknown
+  suggested_context_k: number;
+  context_source: "models" | "probe" | "";
+  note?: string;
+}
+
+// GET /api/llm/tool-schema-issues: tools whose schema a grammar-constrained model server may reject.
+export interface ToolSchemaIssue {
+  tool: string;
+  source: string;
+  issues: { path: string; problem: string }[];
+}
+
+// GET /api/tasks/{id}/summary — technical summary for the operators (Resumen tab).
+export interface TaskSummaryIntent {
+  id: number;
+  summary: string;
+  state: string;
+  blocked_reason?: string;
+}
+export interface TaskSummaryCredential {
+  domain: string;
+  username: string;
+  source: string;
+  note?: string;
+  has_password: boolean;
+}
+export interface CoverageLedgerEntry {
+  surface: string;
+  risk_area: string;
+  outcome: string;
+  evidence?: string;
+  reason?: string;
+  intent_id?: number;
+}
+export interface TaskSummary {
+  intents: TaskSummaryIntent[];
+  intent_counts: Record<string, number>;
+  fact_count: number;
+  findings?: { total?: number; confirmed?: number; open?: number };
+  findings_by_severity: Record<string, number>;
+  credentials: TaskSummaryCredential[];
+  coverage?: {
+    entries?: CoverageLedgerEntry[];
+    gaps?: { kind: string; surface?: string; risk_area: string }[];
+    unexamined?: string[];
+    completeness?: { complete: boolean; state: string; caveat?: string };
+  };
+  coverage_enabled: boolean;
+  tool_calls: number;
+  skill_misses: number;
+  wall_seconds: number;
+  tokens?: { input?: number; output?: number; total?: number };
+  status: string;
 }

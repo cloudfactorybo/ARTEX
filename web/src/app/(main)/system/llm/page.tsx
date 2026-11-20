@@ -6,11 +6,15 @@ import {
   Loader2Icon,
   PlugZapIcon,
   PlusIcon,
+  RadarIcon,
   RefreshCwIcon,
   RotateCcwIcon,
   SaveIcon,
+  ShieldCheckIcon,
   StarIcon,
   Trash2Icon,
+  UploadIcon,
+  WandSparklesIcon,
   ZapIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -26,9 +30,17 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import type {
+  GatewayReport,
+  LLMPoolMember,
+  LLMPoolStatus,
+  LLMProfile,
+  LLMRetryOverride,
+  ToolSchemaIssue,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
@@ -354,6 +366,10 @@ function ProfileSheet({
   const [maxTokensField, setMaxTokensField] = React.useState(NONE); // which field name carries the cap; NONE = max_tokens
   const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // custom session header name; empty = not sent
   const [userAgent, setUserAgent] = React.useState(""); // custom User-Agent; empty = keep the default UA
+  const [caCert, setCaCert] = React.useState(""); // extra CA (PEM) for a self-hosted gateway; empty = system pool
+  const [inspecting, setInspecting] = React.useState(false);
+  const [report, setReport] = React.useState<GatewayReport | null>(null);
+  const caFileRef = React.useRef<HTMLInputElement>(null);
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // retry override for this profile; all 0 = follow the global
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -387,6 +403,8 @@ function ProfileSheet({
     setMaxTokensField(fromStore(profile?.max_tokens_field));
     setSessionHeaderKey(profile?.session_header_key ?? "");
     setUserAgent(profile?.user_agent ?? "");
+    setCaCert(profile?.ca_cert ?? "");
+    setReport(null);
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
@@ -411,7 +429,7 @@ function ProfileSheet({
     setModels([]);
     setModelQuery("");
     try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
+      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId, caCert.trim());
       if (r.ok && r.models && r.models.length > 0) {
         setModels(r.models);
         setModelsOpen(true);
@@ -444,6 +462,7 @@ function ProfileSheet({
         streaming,
         sessionHeaderKey.trim(),
         userAgent.trim(),
+        caCert.trim(),
       );
       // Show the reply too: only when the model demonstrably spoke is this the same as working inside a session.
       if (r.ok)
@@ -455,6 +474,66 @@ function ProfileSheet({
       toast.error(t("Test error: {error}", { error: (e as Error).message }));
     } finally {
       setTesting(false);
+    }
+  }
+
+  // Preset for a self-hosted OpenAI-compatible gateway (GPUStack, cf-llm-ctl, vLLM):
+  // Chat Completions, streaming, no thinking fields, context window detected from the endpoint.
+  function applyGatewayPreset() {
+    setFormat("openai");
+    if (!name.trim()) setName("GPUStack");
+    setStreaming(true);
+    setThinkingType(NONE);
+    setEffort(NONE);
+    setMaxTokensField(NONE);
+    setCw("0");
+    toast.success(t("GPUStack preset applied"), {
+      description: t(
+        "Fill in the base URL ending in /v1, the model and the key; paste the gateway's CA if it uses its own certificate, then run Detect to read its context window.",
+      ),
+    });
+  }
+
+  async function loadCaFile(file: File | undefined) {
+    if (!file) return;
+    if (file.size > 256 * 1024) {
+      toast.error(t("The certificate file is too large"));
+      return;
+    }
+    setCaCert((await file.text()).trim());
+    if (caFileRef.current) caFileRef.current.value = "";
+  }
+
+  async function inspectGateway() {
+    if (inspecting) return;
+    setInspecting(true);
+    setReport(null);
+    try {
+      const r = await api.inspectLLM({
+        provider: format,
+        base_url: baseUrl.trim(),
+        model: model.trim(),
+        api_key: apiKey,
+        proxy: proxy.trim(),
+        ca_cert: caCert.trim(),
+        profile_id: profileId,
+      });
+      setReport(r);
+      if (r.suggested_context_k > 0) {
+        setCw(String(r.suggested_context_k));
+        toast.success(
+          t("The endpoint reports {limit} tokens; context window set to {k}K", {
+            limit: r.context_limit.toLocaleString(),
+            k: r.suggested_context_k,
+          }),
+        );
+      } else {
+        toast.warning(t("Context window not detected: {note}", { note: r.note ?? t("unknown") }));
+      }
+    } catch (e) {
+      toast.error(t("Detection failed: {error}", { error: (e as Error).message }));
+    } finally {
+      setInspecting(false);
     }
   }
 
@@ -488,6 +567,7 @@ function ProfileSheet({
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
         session_header_key: sessionHeaderKey.trim(),
         user_agent: userAgent.trim(),
+        ca_cert: caCert.trim(),
         retry,
       });
       if (isNew) toast.success(t('Created: {name} (use "Set as active" on its card to enable it)', { name: name.trim() }));
@@ -534,6 +614,15 @@ function ProfileSheet({
         </SheetHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
+          <div className="flex items-center justify-between gap-3 rounded-md border border-dashed px-3 py-2">
+            <p className="text-muted-foreground text-xs">
+              {t("Self-hosted model behind GPUStack, cf-llm-ctl or vLLM?")}
+            </p>
+            <Button type="button" variant="outline" size="sm" onClick={applyGatewayPreset}>
+              <WandSparklesIcon />
+              {t("GPUStack preset")}
+            </Button>
+          </div>
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
               <Label htmlFor="p-name">{t("Name")}</Label>
@@ -661,6 +750,39 @@ function ProfileSheet({
           </div>
 
           <div className="grid gap-2">
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="p-ca-cert" className="flex items-center gap-1.5">
+                <ShieldCheckIcon className="size-3.5" />
+                {t("CA certificate (optional)")}
+              </Label>
+              <input
+                ref={caFileRef}
+                type="file"
+                accept=".crt,.pem,.cer,.txt"
+                className="hidden"
+                onChange={(e) => void loadCaFile(e.target.files?.[0])}
+              />
+              <Button type="button" variant="ghost" size="sm" onClick={() => caFileRef.current?.click()}>
+                <UploadIcon />
+                {t("Load file")}
+              </Button>
+            </div>
+            <Textarea
+              id="p-ca-cert"
+              className="min-h-20 font-mono text-xs"
+              placeholder="-----BEGIN CERTIFICATE-----"
+              value={caCert}
+              onChange={(e) => setCaCert(e.target.value)}
+              spellCheck={false}
+            />
+            <p className="text-muted-foreground text-xs">
+              {t(
+                "For a gateway that uses its own certificate authority (self-signed). Paste the CA in PEM format or load the .crt file; it is trusted for this profile only, on top of the system CAs. Leave empty for a public certificate.",
+              )}
+            </p>
+          </div>
+
+          <div className="grid gap-2">
             <Label htmlFor="p-session-header">{t("Custom session header (optional)")}</Label>
             <Input
               id="p-session-header"
@@ -727,15 +849,29 @@ function ProfileSheet({
             </div>
             <div className="grid gap-2">
               <Label htmlFor="p-cw">{t("Context window (K)")}</Label>
-              <Input
-                id="p-cw"
-                type="number"
-                min={0}
-                max={1000}
-                value={cw}
-                onChange={(e) => setCw(e.target.value)}
-                placeholder="200"
-              />
+              <div className="flex gap-2">
+                <Input
+                  id="p-cw"
+                  type="number"
+                  min={0}
+                  max={1000}
+                  value={cw}
+                  onChange={(e) => setCw(e.target.value)}
+                  placeholder="200"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className="shrink-0"
+                  disabled={inspecting || !baseUrl.trim()}
+                  onClick={inspectGateway}
+                  title={t("Detect the context window and health from the endpoint")}
+                  aria-label={t("Detect the context window and health from the endpoint")}
+                >
+                  {inspecting ? <Loader2Icon className="animate-spin" /> : <RadarIcon />}
+                </Button>
+              </div>
             </div>
           </div>
           <p className="-mt-2 text-muted-foreground text-xs">
@@ -743,6 +879,45 @@ function ProfileSheet({
               "Rate limits of 0 mean unlimited, shared across all agents. The context window is in K (thousand tokens); 0 = the 200K default, capped at 1000 (i.e. 1M). Setting it too high keeps compression from ever triggering.",
             )}
           </p>
+          <p className="-mt-2 text-muted-foreground text-xs">
+            {t(
+              "For an OpenAI-format endpoint saved with 0, ARTEX reads the window the endpoint reports and fills it in after saving. The radar button does it now and checks the health route.",
+            )}
+          </p>
+          {report && (
+            <div className="grid gap-1.5 rounded-md border bg-muted/40 px-3 py-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-medium">{t("Health")}</span>
+                {report.healthy === null ? (
+                  <Badge variant="outline">{t("No health route")}</Badge>
+                ) : report.healthy ? (
+                  <Badge variant="outline" className="border-emerald-400 text-emerald-600">
+                    {t("Healthy")} · {report.health_url}
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" className="border-destructive text-destructive">
+                    {t("Unreachable")} · {report.health_url}
+                  </Badge>
+                )}
+              </div>
+              <div>
+                <span className="font-medium">{t("Context window")}: </span>
+                {report.context_limit > 0
+                  ? t("{limit} tokens (from {source}); {k}K applied with a margin for the gateway's estimate", {
+                      limit: report.context_limit.toLocaleString(),
+                      source: report.context_source === "models" ? "/models" : t("a probe request"),
+                      k: report.suggested_context_k,
+                    })
+                  : (report.note ?? t("unknown"))}
+              </div>
+              {report.models && report.models.length > 0 && (
+                <div className="font-mono">
+                  <span className="font-medium font-sans">{t("Models")}: </span>
+                  {report.models.join(", ")}
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="grid gap-3 rounded-lg border p-3">
             <div className="flex items-center justify-between gap-4">
@@ -923,12 +1098,18 @@ export default function LLMPage() {
     }
   }, []);
 
+  const [schemaIssues, setSchemaIssues] = React.useState<ToolSchemaIssue[]>([]);
+
   const load = React.useCallback(async () => {
     try {
       setProfiles(await api.llmProfiles());
     } catch {
       /* ignore */
     }
+    api
+      .toolSchemaIssues()
+      .then(setSchemaIssues)
+      .catch(() => setSchemaIssues([]));
     await loadPool();
   }, [loadPool]);
 
@@ -971,6 +1152,25 @@ export default function LLMPage() {
 
   return (
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
+      {schemaIssues.length > 0 && (
+        <div className="rounded-md border border-amber-400/60 bg-amber-500/5 px-4 py-3 text-sm">
+          <p className="font-medium">
+            {t("{count} tool(s) have schemas a self-hosted model server may reject", { count: schemaIssues.length })}
+          </p>
+          <p className="mt-1 text-muted-foreground text-xs">
+            {t(
+              "vLLM (GPUStack, cf-llm-ctl) fails the whole request when a tool's JSON Schema uses Unicode in a pattern. ARTEX removes those patterns before sending, so tasks keep working; fix the tools to keep their validation hints.",
+            )}
+          </p>
+          <ul className="mt-2 grid gap-0.5 font-mono text-xs">
+            {schemaIssues.map((i) => (
+              <li key={i.tool}>
+                {i.tool} · {i.issues.map((x) => x.path).join(", ")}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="font-semibold text-xl tracking-tight">LLM</h1>

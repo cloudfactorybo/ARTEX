@@ -11,7 +11,6 @@ import (
 	"log"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -2152,6 +2151,11 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.UserAgent = ua
+	// Extra CA for a self-hosted gateway: must parse as PEM certificates.
+	if p.CACert, err = agent.ValidateCACert(p.CACert); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2165,6 +2169,11 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// profile's key/model/priority/pool_exclude edit reshapes the chain, so the
 	// engine's provider has to be rebuilt either way.
 	s.reapplyActiveProfile()
+	// A GPUStack / vLLM / cf-llm-ctl profile saved without a context window gets
+	// the one its endpoint reports, off the request path.
+	if p.ContextWindowK == 0 {
+		go s.autoDetectContextWindow(id)
+	}
 	writeJSON(w, 200, map[string]any{"id": id})
 }
 
@@ -2318,6 +2327,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		APIKey    string `json:"api_key"`
 		Proxy     string `json:"proxy"`
 		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		CACert    string `json:"ca_cert"`    // extra CA (PEM); empty = the stored profile's CA, if any
 	}
 	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -2419,12 +2429,17 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build HTTP client with optional proxy.
-	transport := &http.Transport{}
-	if p := strings.TrimSpace(req.Proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
-			transport.Proxy = http.ProxyURL(pu)
+	// Build HTTP client with optional proxy and the profile's extra CA.
+	caCert := strings.TrimSpace(req.CACert)
+	if caCert == "" && req.ProfileID != nil {
+		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+			caCert = p.CACert
 		}
+	}
+	transport, err := agent.HTTPTransport(req.Proxy, caCert)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
 	}
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 
@@ -2599,4 +2614,133 @@ func templateFields(t *template.Template) []string {
 		walk(t.Tree.Root)
 	}
 	return out
+}
+
+// POST /api/llm/inspect — health route, model list and context window of an
+// OpenAI-format endpoint (GPUStack, cf-llm-ctl, vLLM). Body: profile_id, or the
+// form fields (provider, base_url, model, api_key, proxy, ca_cert); form values
+// win and blanks fall back to the stored profile. The stored key is only sent
+// to the endpoint it was saved for.
+func (s *Server) inspectLLM(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider  string `json:"provider"`
+		BaseURL   string `json:"base_url"`
+		Model     string `json:"model"`
+		APIKey    string `json:"api_key"`
+		Proxy     string `json:"proxy"`
+		CACert    string `json:"ca_cert"`
+		ProfileID *int64 `json:"profile_id"`
+	}
+	if err := decode(w, r, &req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	var stored *db.LLMProfile
+	if req.ProfileID != nil {
+		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+			stored = p
+		}
+	}
+	if isMaskedSecret(req.Proxy) {
+		req.Proxy = ""
+	}
+	if stored != nil {
+		if strings.TrimSpace(req.Provider) == "" {
+			req.Provider = stored.Format
+		}
+		if strings.TrimSpace(req.BaseURL) == "" {
+			req.BaseURL = stored.BaseURL
+		}
+		if strings.TrimSpace(req.Model) == "" {
+			req.Model = stored.Model
+		}
+		if strings.TrimSpace(req.Proxy) == "" {
+			req.Proxy = stored.Proxy
+		}
+		if strings.TrimSpace(req.CACert) == "" {
+			req.CACert = stored.CACert
+		}
+		if strings.TrimSpace(req.APIKey) == "" && sameLLMEndpoint(req.Provider, req.BaseURL, stored.Format, stored.BaseURL) {
+			req.APIKey = stored.APIKey
+		}
+	}
+	ca, err := agent.ValidateCACert(req.CACert)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	cfg.CACert = ca
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	writeJSON(w, 200, agent.InspectGateway(ctx, cfg))
+}
+
+// autoDetectContextWindow fills context_window_k for a saved OpenAI-format
+// profile left at 0, from the limit its endpoint reports. A value the user set
+// is never touched: the update only applies while the column is still 0.
+func (s *Server) autoDetectContextWindow(id int64) {
+	p, err := s.m.pg.ProfileByID(id)
+	if err != nil || p == nil || p.ContextWindowK != 0 || (p.Format != "openai" && p.Format != "ollama") {
+		return
+	}
+	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	cfg.CACert, cfg.UserAgent = p.CACert, p.UserAgent
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	rep := agent.InspectGateway(ctx, cfg)
+	if rep.SuggestedK <= 0 {
+		log.Printf("[llm] profile %d (%s): context window not detected: %s", id, p.Name, rep.Note)
+		return
+	}
+	res, err := s.m.pg.Exec(`UPDATE llm_profiles SET context_window_k=$1 WHERE id=$2 AND context_window_k=0`, rep.SuggestedK, id)
+	if err != nil {
+		log.Printf("[llm] profile %d: store detected context window: %v", id, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("[llm] profile %d (%s): endpoint reports a %d-token window (%s); context window set to %dK", id, p.Name, rep.ContextLimit, rep.ContextSource, rep.SuggestedK)
+		s.invalidateProfileAgents()
+		s.reapplyActiveProfile()
+	}
+}
+
+// toolSchemaIssue is one tool whose stored schema a grammar-constrained model
+// server may fail to compile. Agents receive it with the offending patterns removed.
+type toolSchemaIssue struct {
+	Tool   string               `json:"tool"`
+	Source string               `json:"source"`
+	Issues []agent.GrammarIssue `json:"issues"`
+}
+
+// GET /api/llm/tool-schema-issues — tools whose schemas carry constructs vLLM
+// may fail to compile (Unicode in patterns). They are sanitized before every
+// request; this lists them so their owners can fix them.
+func (s *Server) toolSchemaIssues(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	rows, err := pg.Query(`SELECT key, kind, schema::text FROM tools WHERE schema IS NOT NULL ORDER BY key`)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []toolSchemaIssue{}
+	for rows.Next() {
+		var key, kind, raw string
+		if err := rows.Scan(&key, &kind, &raw); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		var schema map[string]any
+		if json.Unmarshal([]byte(raw), &schema) != nil {
+			continue
+		}
+		if issues := agent.SchemaGrammarIssues(schema); len(issues) > 0 {
+			out = append(out, toolSchemaIssue{Tool: key, Source: kind, Issues: issues})
+		}
+	}
+	writeJSON(w, 200, map[string]any{"tools": out})
 }

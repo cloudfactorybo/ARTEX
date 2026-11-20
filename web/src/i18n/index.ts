@@ -10,32 +10,41 @@
 //
 // To translate the UI into another language, add locales/<code>.json and list it in LOCALES.
 
+import es from "./locales/es.json";
 import tr from "./locales/tr.json";
 
-export type Locale = "tr" | "en";
+export type Locale = "es" | "en" | "tr";
 
 // Used when nothing is saved and the browser language is not one of LOCALES,
 // and for the static prerender, which has no browser.
-export const DEFAULT_LOCALE: Locale = "en";
+export const DEFAULT_LOCALE: Locale = "es";
 
 export const LOCALES: { code: Locale; label: string }[] = [
-  { code: "tr", label: "Türkçe" },
+  { code: "es", label: "Español" },
   { code: "en", label: "English" },
+  { code: "tr", label: "Türkçe" },
 ];
 
 const STORAGE_KEY = "artex.locale";
 
 const DICTIONARIES: Record<Locale, Record<string, string>> = {
-  tr: tr as Record<string, string>,
+  es: es as Record<string, string>,
   en: {},
+  tr: tr as Record<string, string>,
 };
+
+const INTL_LOCALES: Record<Locale, string> = { es: "es-BO", en: "en-US", tr: "tr-TR" };
+
+function isLocale(value: string | null): value is Locale {
+  return LOCALES.some((l) => l.code === value);
+}
 
 function detectLocale(): Locale {
   // Prerendering (static export) has no window: it renders the default locale.
   if (typeof window === "undefined") return DEFAULT_LOCALE;
   try {
     const saved = window.localStorage.getItem(STORAGE_KEY);
-    if (saved === "tr" || saved === "en") return saved;
+    if (isLocale(saved)) return saved;
   } catch {
     /* storage blocked: fall through to the browser language */
   }
@@ -52,7 +61,7 @@ export const locale: Locale = detectLocale();
 if (typeof document !== "undefined") document.documentElement.lang = locale;
 
 /** BCP 47 tag for Intl / toLocaleString calls, e.g. date.toLocaleString(intlLocale). */
-export const intlLocale = locale === "tr" ? "tr-TR" : "en-US";
+export const intlLocale = INTL_LOCALES[locale];
 
 const dict = DICTIONARIES[locale];
 
