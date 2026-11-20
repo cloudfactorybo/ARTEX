@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
+import { auth } from "@/lib/auth";
 
 export function ChangePasswordDialog({
   open,
@@ -29,14 +30,20 @@ export function ChangePasswordDialog({
   const [newPassword, setNewPassword] = React.useState("");
   const [confirmPassword, setConfirmPassword] = React.useState("");
   const [saving, setSaving] = React.useState(false);
+  const [username, setUsername] = React.useState("");
 
-  // reset fields whenever the dialog closes
+  // reset fields whenever the dialog closes; read the signed-in account when it opens
   React.useEffect(() => {
     if (!open) {
       setOldPassword("");
       setNewPassword("");
       setConfirmPassword("");
+      return;
     }
+    api
+      .me()
+      .then((me) => setUsername(me.username))
+      .catch(() => setUsername(""));
   }, [open]);
 
   function submit(e: React.FormEvent) {
@@ -53,8 +60,11 @@ export function ChangePasswordDialog({
     api
       .changePassword(oldPassword, newPassword)
       .then(() => {
-        toast.success(t("Password changed"));
+        // The change revokes every session of the account, this one included.
+        toast.success(t("Password changed; sign in again with the new password"));
         onOpenChange(false);
+        auth.clearToken();
+        window.setTimeout(() => window.location.replace("/login"), 1200);
       })
       .catch((err) => toast.error(t("Change failed: {error}", { error: (err as Error).message })))
       .finally(() => setSaving(false));
@@ -62,7 +72,7 @@ export function ChangePasswordDialog({
 
   // The username stays bold; it is placed through a placeholder so the sentence is translated whole.
   const [descBefore, descAfter = ""] = t(
-    "The username is fixed as {username}. Enter the current password to verify; login tokens issued before the change stay valid until they expire.",
+    "You are changing the password of {username}. Enter the current password to verify; afterwards every open session of this account, this one included, must sign in again.",
   ).split("{username}");
 
   return (
@@ -73,7 +83,7 @@ export function ChangePasswordDialog({
             <DialogTitle>{t("Change password")}</DialogTitle>
             <DialogDescription>
               {descBefore}
-              <b>ARTEX</b>
+              <b>{username || "…"}</b>
               {descAfter}
             </DialogDescription>
           </DialogHeader>

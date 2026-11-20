@@ -80,9 +80,11 @@ var errWorkControlConflict = errors.New("work control conflict")
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
 // A NOA budget refusal is deterministic and never reached the provider, so a
-// rerun would only fail the same way.
+// rerun would only fail the same way. So is a request the model server rejects
+// outright (a tool schema it cannot compile, a 400/401/403/404/422).
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !errors.Is(err, agent.ErrNoaBudget)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !errors.Is(err, agent.ErrNoaBudget) &&
+		!agent.IsDeterministicRequestError(err)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -1390,6 +1392,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	var stateErr error
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		stateErr = t.Store.SettleIntentClaimBlocked(intent.ID, token, db.IntentBlockedLLMQuota)
+	} else if state == "blocked" && agent.IsToolGrammarError(err) {
+		stateErr = t.Store.SettleIntentClaimBlocked(intent.ID, token, db.IntentBlockedToolSchema)
 	} else {
 		stateErr = t.Store.SettleIntentClaim(intent.ID, token, state)
 	}

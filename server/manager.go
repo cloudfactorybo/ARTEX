@@ -325,6 +325,9 @@ const (
 	// Target noise profile (off|quiet|balanced|aggressive). When stored it wins over
 	// ARTEX_NOISE_PROFILE, which stays the fallback; applied at startup and on PUT.
 	settingNoiseProfile = "noise_profile"
+	// Output language of agents' human-facing text (es|en|auto). When stored it
+	// wins over ARTEX_AGENT_LANGUAGE; default Spanish. Applied at startup and on PUT.
+	settingAgentLanguage = "agent_language"
 	// defaultWebSearchBackend is used when web search is on but no backend was picked.
 	defaultWebSearchBackend = "ddgs"
 	// deepSeekWebSearchBackend borrows the active LLM profile instead of its own
@@ -423,6 +426,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		return nil, fmt.Errorf("recover finding retests: %w", err)
 	}
 	egress.SetProfile(startupNoiseProfile(pg))
+	agent.SetAgentLanguage(startupAgentLanguage(pg))
 	if err := pg.EnsureLLMRecordsTable(); err != nil {
 		log.Printf("[llmrec] create table: %v", err)
 	}

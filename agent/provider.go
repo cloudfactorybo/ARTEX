@@ -87,6 +87,10 @@ type Config struct {
 	// context via transcript.WithSessionID and read by the RoundTripper, so even a
 	// shared provider emits different header values per session.
 	SessionHeaderKey string
+	// CACert holds extra CA certificates (PEM) trusted for this endpoint on top of
+	// the system pool, for self-hosted gateways with their own CA. Empty = system
+	// pool only. Validated by ValidateCACert.
+	CACert string
 	// UserAgent, when non-empty, overrides the User-Agent header on every outbound
 	// LLM request built from this config. Empty = don't set it, leaving the Go/Norma
 	// default UA untouched (the historical behavior). Validated by ValidateUserAgent.
@@ -362,7 +366,7 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
+	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent, c.CACert)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +412,11 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if c.RatePerSecond > 0 || c.RatePerMinute > 0 {
 		lc.RateLimit = &llm.RateLimit{PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute}
 	}
-	return llm.NewProvider(lc)
+	p, err := llm.NewProvider(lc)
+	if err != nil {
+		return nil, err
+	}
+	return clarifyingProvider{p}, nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,
@@ -533,8 +541,15 @@ func requestBodySnapshot(req *http.Request) string {
 	return string(b)
 }
 
-func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Client, error) {
+func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent, caPEM string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	tlsCfg, err := caTLSConfig(caPEM)
+	if err != nil {
+		return nil, fmt.Errorf("llm: %w", err)
+	}
+	if tlsCfg != nil {
+		transport.TLSClientConfig = tlsCfg
+	}
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
 		transport.Proxy = nil // empty = direct; no fallback to the HTTP_PROXY/HTTPS_PROXY env vars

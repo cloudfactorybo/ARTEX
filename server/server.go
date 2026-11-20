@@ -64,6 +64,8 @@ type Server struct {
 	// the production keys. Tests set unique keys so a shared database is left alone.
 	authHashKey    string
 	authVersionKey string
+	// users mirrors the additional accounts (users table) for session checks.
+	users userCache
 
 	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
 	pwdLimit       *loginLimiter  // attempt limit on POST /api/auth/change-password (IP + session token)
@@ -192,6 +194,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	}
 	s.initSetupToken()
 	s.loadPasswordVersion()
+	s.loadUsers()
 	s.initSideQuestions()
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,
 	// and again on every policy save (saveLLMRetryPolicy).
@@ -414,6 +417,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.CACert = p.CACert
 	s.applyProfileRetry(&cfg, p)
 	// Ollama profiles run keyless (local server); the other formats need a key.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
@@ -593,6 +597,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.CACert = p.CACert
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
@@ -745,6 +750,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
+	mux.HandleFunc("GET /api/auth/me", s.authMe)
+	// Additional accounts (all with the same permissions) and the audit log.
+	mux.HandleFunc("GET /api/users", s.usersList)
+	mux.HandleFunc("POST /api/users", s.usersCreate)
+	mux.HandleFunc("PATCH /api/users/{id}", s.usersUpdate)
+	mux.HandleFunc("DELETE /api/users/{id}", s.usersDelete)
+	mux.HandleFunc("GET /api/users/audit", s.auditList)
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/ready", s.ready)
@@ -767,6 +779,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/task-templates/{id}", s.pgDeleteTaskTemplate)
 	mux.HandleFunc("GET /api/tasks/{id}", s.getTask)
 	mux.HandleFunc("GET /api/tasks/{id}/outcome", s.taskOutcome)
+	mux.HandleFunc("GET /api/tasks/{id}/summary", s.taskSummary)
 	mux.HandleFunc("GET /api/tasks/{id}/lessons", s.taskLessons)
 	mux.HandleFunc("POST /api/tasks/{id}/lessons/extract", s.extractTaskLessons)
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.updateTaskMetadata)
@@ -829,6 +842,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm", s.getLLM)
 	mux.HandleFunc("POST /api/llm", s.setLLM)
 	mux.HandleFunc("POST /api/llm/test", s.testLLM)
+	mux.HandleFunc("POST /api/llm/inspect", s.inspectLLM)
+	mux.HandleFunc("GET /api/llm/tool-schema-issues", s.toolSchemaIssues)
 
 	// asset system
 	mux.HandleFunc("GET /api/assets", s.listAssets)
@@ -1524,6 +1539,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Streaming        *bool  `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
 		SessionHeaderKey string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
 		UserAgent        string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
+		CACert           string `json:"ca_cert"`            // extra CA (PEM) for the endpoint; empty = the stored profile's CA, if any
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1605,6 +1621,15 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.UserAgent = ua
+	// The extra CA follows the profile like the UA: form value first, else the stored one.
+	cfg.CACert = strings.TrimSpace(req.CACert)
+	if stored != nil && cfg.CACert == "" {
+		cfg.CACert = stored.CACert
+	}
+	if cfg.CACert, err = agent.ValidateCACert(cfg.CACert); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	// Keyless formats (Ollama) skip the key resolution entirely.
 	if cfg.NeedsAPIKey() {
 		// API key resolution precedence: form input > the named profile's stored key > the global config's key.
@@ -3846,6 +3871,8 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_assets_max_shown":  limits.AssetsShown,
 		// Effective target noise profile (off by default): the stored setting, else ARTEX_NOISE_PROFILE.
 		"noise_profile": egress.CurrentProfile().Name,
+		// Language of the agents' human-facing text (es|en|auto): the stored setting, else ARTEX_AGENT_LANGUAGE, else es.
+		"agent_language": agent.AgentLanguage(),
 	}
 }
 
@@ -3925,12 +3952,22 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyAssetsMaxShown  *int `json:"notify_assets_max_shown"`
 		// Target noise profile: off|quiet|balanced|aggressive; null = unchanged. Applies to the next request, no agent rebuild.
 		NoiseProfile *string `json:"noise_profile"`
+		// Agents' output language: es|en|auto; null = unchanged. Applies to the next prompt build, no agent rebuild.
+		AgentLanguage *string `json:"agent_language"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	// Validated before any other field is written, so a bad value changes nothing.
+	var language string
+	if req.AgentLanguage != nil {
+		var ok bool
+		if language, ok = agent.ParseAgentLanguage(*req.AgentLanguage); !ok {
+			writeErr(w, 400, "agent_language must be es, en or auto")
+			return
+		}
+	}
 	var noise egress.Profile
 	if req.NoiseProfile != nil {
 		var ok bool
@@ -3943,6 +3980,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		egress.SetProfile(noise)
+	}
+	if req.AgentLanguage != nil {
+		code := language
+		if err := s.m.pg.SetSetting(settingAgentLanguage, code); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		agent.SetAgentLanguage(code)
 	}
 	// A masked placeholder echoed back keeps the stored secret, like null.
 	req.BraveKey, req.TavilyKey, req.KeenableKey = keepIfMasked(req.BraveKey), keepIfMasked(req.TavilyKey), keepIfMasked(req.KeenableKey)

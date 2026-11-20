@@ -49,6 +49,7 @@ import { GraphTab } from "./_tabs/graph-tab";
 import { InterceptTab } from "./_tabs/intercept-tab";
 import { OverviewTab } from "./_tabs/overview-tab";
 import { ReportTab } from "./_tabs/report-tab";
+import { SummaryTab } from "./_tabs/summary-tab";
 import { RetestsTab } from "./_tabs/retests-tab";
 import { SessionsTab } from "./_tabs/sessions-tab";
 import { setVisibleInterval } from "@/lib/polling";
@@ -65,6 +66,7 @@ const TABS = [
   { value: "coverage", label: t("Asset coverage") },
   { value: "intercept", label: t("Interception approval") },
   { value: "report", label: t("Report") },
+  { value: "resumen", label: t("Summary") },
 ];
 
 function taskProfileIDs(task: Task): string[] {
@@ -469,6 +471,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="report" className="mt-0">
           <ReportTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="resumen" className="mt-0">
+          <SummaryTab taskId={id} />
         </TabsContent>
       </div>
     </Tabs>

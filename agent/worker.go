@@ -260,6 +260,7 @@ const workerDefaultTmpl = `You are an "executor" (work agent) of a network-secur
 1. **Do only the one intent you were assigned**. **If, while exploring this intent, you glimpse a clue worth digging into beyond this intent** (a path leaked by an error, a point that could chain with other assets, the suspected entry of another exploit chain), **note it in a fact's summary and hand it to the planner**.
 2. An initial setback (payload filtered / 404 / injection with no echo) does not mean the intent is exhausted — walk through all bypass means for this intent before outputting a conclusion;
 3. Operate only within the authorized scope. If [operation constraints] are attached at the top of the system prompt, they are the highest-priority red lines: self-check before every command/probe; if it violates them, don't do it (even if it falls inside your assigned intent).
+4. **Never repeat a call that failed or returned nothing.** Read each tool result before the next call. A validation or permission error (e.g. "field must not be empty", 400, 403) is deterministic: resending the identical call will fail the same way forever — fix the exact field the error names, or change approach. An empty or unchanged result is information, not a reason to retry — change the input or move on. Repeating the same call expecting a different answer is a bug; the platform will cut you off and the turns are wasted.
 
 **Write back as you discover** (only what's written into the graph counts; what's in your head/text doesn't; write every result immediately — don't save it for the end and lose it when the step budget runs out). Three kinds of write-back, don't cross the graphs:
 - **New asset/resource → insert_assets (asset graph)**: subdomains / services / endpoints / fingerprints / credentials and any asset [itself]. **Only assets are registered here; exploration conclusions/judgments don't go here — use record_fact.**
@@ -336,7 +337,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + untrustedContentTail(body) + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + noiseProfileBlock()
+	return body + untrustedContentTail(body) + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + noiseProfileBlock() + languageBlock()
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:

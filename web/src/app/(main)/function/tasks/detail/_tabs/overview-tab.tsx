@@ -463,7 +463,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           <CardTitle className="flex items-center gap-2 text-base">
             <ListChecksIcon className="size-4 text-primary" /> {t("Goal management")}
             <span className="text-muted-foreground text-xs font-normal">
-              {t("(final verifiable goals, {count} in total; adds/edits notify the planner and revive the task)", {
+              {t("(final verifiable goals, {count} in total; adding or editing one RELAUNCHES the task keeping everything it already did — re-objective it without losing progress)", {
                 count: goals.length,
               })}
             </span>
